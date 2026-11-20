@@ -423,6 +423,68 @@ def _sanitize_model_for_coppelia(content: str) -> str:
     return content
 
 
+def _is_zero_pose(pose_text: str | None) -> bool:
+    """Returns True if an SDF pose string is missing or represents the identity pose."""
+    if not pose_text or not pose_text.strip():
+        return True
+    try:
+        return all(abs(float(v)) < 1e-9 for v in pose_text.split())
+    except ValueError:
+        return False
+
+
+def _resolve_wrapper_models(models_dir: Path) -> dict[str, str]:
+    """
+    Finds pure-wrapper models (no <link> or <joint>, single <include> with zero pose)
+    and resolves them transitively to their target model directory.
+
+    CoppeliaSim's simSDF importer does not propagate an outer <include><pose> down
+    into a nested <include>'s links, so wrapper models (e.g. '* Lights Type B' after
+    stripping <light> tags) would otherwise be placed at the origin.
+    """
+    direct_map: dict[str, str] = {}
+    if not models_dir.is_dir():
+        return direct_map
+
+    for model_dir in sorted(models_dir.iterdir()):
+        model_sdf = model_dir / "model.sdf"
+        if not model_sdf.is_file():
+            continue
+        try:
+            root = ET.fromstring(model_sdf.read_text(encoding="utf-8"))
+        except ET.ParseError:
+            continue
+
+        model = root.find("model")
+        if model is None:
+            continue
+        if model.findall(".//link") or model.findall(".//joint"):
+            continue
+
+        includes = model.findall("include")
+        if len(includes) != 1:
+            continue
+
+        inc = includes[0]
+        if not _is_zero_pose(inc.findtext("pose")):
+            continue
+
+        uri_text = (inc.findtext("uri") or "").strip()
+        if uri_text and Path(uri_text).is_dir():
+            direct_map[str(model_dir.resolve())] = str(Path(uri_text).resolve())
+
+    resolved: dict[str, str] = {}
+    for src in direct_map:
+        cur = src
+        seen: set[str] = set()
+        while cur in direct_map and cur not in seen:
+            seen.add(cur)
+            cur = direct_map[cur]
+        if cur != src:
+            resolved[src] = cur
+    return resolved
+
+
 def generate_local_sdf(sdf_path: Path, models_dir: Path, as_model: bool = True) -> Path:
     """
     Generates <scenario>_local.sdf by replacing Fuel remote URLs with absolute local paths.
@@ -432,6 +494,16 @@ def generate_local_sdf(sdf_path: Path, models_dir: Path, as_model: bool = True) 
     """
     content = sdf_path.read_text(encoding="utf-8")
     new_content = localize_sdf_content(content, models_dir)
+
+    # Flatten pure-wrapper <include> targets (e.g. '* Lights Type B' -> '* Type B')
+    wrapper_map = _resolve_wrapper_models(models_dir)
+    if wrapper_map:
+        def _unwrap_uri(match: re.Match) -> str:
+            uri_val = match.group(1).strip()
+            target = wrapper_map.get(uri_val)
+            return f"<uri>{target}</uri>" if target else match.group(0)
+
+        new_content = re.sub(r"<uri>\s*([^<]+?)\s*</uri>", _unwrap_uri, new_content)
 
     if as_model and "<world" in new_content:
         # Convert <world name="..."> into <model name="..."> with <static>true</static>
